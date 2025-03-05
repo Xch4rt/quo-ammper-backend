@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from models import BelvoLink, User  
 from schemas import BelvoLinkCreate  
 from database import SessionLocal, get_db
-from auth import verify_token
+from auth import get_current_user, verify_token
 
 router = APIRouter()
 
@@ -15,6 +15,11 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM")
+
+BELVO_SECRET_ID = os.getenv("BELVO_SECRET_ID")
+BELVO_SECRET_PASSWORD = os.getenv("BELVO_SECRET_PASSWORD")
+BELVO_BASE_URL = os.getenv("BELVO_BASE_URL")
+BELVO_HOST = os.getenv("BELVO_HOST")
 
 def verify_token(token: str):
     try:
@@ -32,9 +37,7 @@ def verify_token(token: str):
 async def get_banks(token: str = Depends(oauth2_scheme)):
     verified_token = verify_token(token)
     
-    BELVO_BASE_URL = os.getenv("BELVO_BASE_URL")
-    BELVO_SECRET_ID = os.getenv("BELVO_SECRET_ID")
-    BELVO_SECRET_PASSWORD = os.getenv("BELVO_SECRET_PASSWORD")
+    
     
     headers = {
         "Content-Type": "application/json",
@@ -53,27 +56,37 @@ async def get_banks(token: str = Depends(oauth2_scheme)):
             raise HTTPException(status_code=response.status_code, detail=response.text)
         
 @router.get("/balance")
-async def get_balance(token: str = Depends(oauth2_scheme)):
+async def get_balance(
+    link_id: str,  # <--- recibiendo por query param
+    token: str = Depends(oauth2_scheme)
+):
     verified_token = verify_token(token)
-    
-    BELVO_BASE_URL = os.getenv("BELVO_BASE_URL")
-    BELVO_SECRET_ID = os.getenv("BELVO_SECRET_ID")
-    BELVO_SECRET_PASSWORD = os.getenv("BELVO_SECRET_PASSWORD")
-    
+
+    # Llamada con el link_id
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"{BELVO_BASE_URL}/transactions/",
-            auth=(BELVO_SECRET_ID, BELVO_SECRET_PASSWORD)
+            f"{BELVO_BASE_URL}/transactions/?link={link_id}",
+            auth=(BELVO_SECRET_ID, BELVO_SECRET_PASSWORD),
         )
-    
+
     if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-        
-    transactions = response.json()
-        
-    incomes = sum(item["amount"] for item in transactions if item["amount"] > 0)
-    expenses = sum(item["amount"] for item in transactions if item["amount"] < 0)
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.text
+        )
+
+    # IMPORTANTE: tomar las transacciones de "results"
+    data = response.json()
+    transactions = data["results"]  # <--- AQUÍ extraes la lista
+
+    # Calcular ingresos y egresos basado en el tipo de transacción
+    incomes = sum(item["amount"] for item in transactions if item["type"] == "INFLOW")
+    expenses = sum(item["amount"] for item in transactions if item["type"] == "OUTFLOW")
     balance = incomes - expenses
+
+    print("incomes", incomes)
+    print("expenses", expenses)
+    print("balance", balance)
     return {
         "incomes": incomes,
         "expenses": expenses,
@@ -81,8 +94,7 @@ async def get_balance(token: str = Depends(oauth2_scheme)):
         "transactions": transactions
     }
         
-        
-@router.post("/belvo/links", status_code=status.HTTP_201_CREATED)
+@router.post("/links", status_code=status.HTTP_201_CREATED)
 async def create_belvo_link(
     link_data: BelvoLinkCreate,
     token: str = Depends(oauth2_scheme),
@@ -114,3 +126,44 @@ async def create_belvo_link(
     db.refresh(new_link)
     
     return new_link
+
+
+@router.get("/access-token")
+async def get_belvo_access_token(current_user: User = Depends(get_current_user)):
+    print("current_user", current_user)
+    try:
+        
+        payload = {
+            "id": BELVO_SECRET_ID,
+            "password": BELVO_SECRET_PASSWORD,
+            "scopes": "read_institutions,write_links",
+            "fetch_resources": ["ACCOUNTS", "TRANSACTIONS", "OWNERS"],
+            "credentials_storage": "store",
+            "stale_in": "300d"
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Host": BELVO_HOST
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{BELVO_BASE_URL}/token/",
+                json=payload,
+                headers=headers
+            )
+            
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail="Error al obtener el token de Belvo"
+                )
+            
+            return {"access": response.json()["access"]}
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generando access token: {str(e)}"
+        )
